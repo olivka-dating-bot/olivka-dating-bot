@@ -1,9 +1,19 @@
 import os
+import io
 import logging
 from html import escape
+from pathlib import Path
 
 import asyncpg
 from aiohttp import web
+
+from PIL import (
+    Image,
+    ImageDraw,
+    ImageFont,
+    ImageFilter,
+    ImageOps,
+)
 
 from telegram import (
     Update,
@@ -13,6 +23,8 @@ from telegram import (
     InlineKeyboardMarkup,
     InputMediaPhoto,
     InputMediaVideo,
+    BotCommand,
+    MenuButtonCommands,
 )
 
 from telegram.ext import (
@@ -43,24 +55,17 @@ logger = logging.getLogger("olivka-match")
 # ============================================================
 
 TOKEN = os.getenv("BOT_TOKEN")
-
-PORT = int(
-    os.getenv("PORT", "10000")
-)
+PORT = int(os.getenv("PORT", "10000"))
 
 DB_HOST = os.getenv("DB_HOST")
-DB_PORT = int(
-    os.getenv("DB_PORT", "5432")
-)
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 
 MAX_MEDIA = 6
-
-# Сколько существующих анкет автоматически
-# показать человеку после регистрации.
 INITIAL_AUTO_PROFILES = 3
+MAX_MATCHES_TO_SHOW = 10
 
 
 (
@@ -80,10 +85,864 @@ db_pool = None
 
 
 # ============================================================
+# DESIGN
+# ============================================================
+
+CARD_WIDTH = 1080
+CARD_HEIGHT = 1350
+
+PINK = (244, 95, 160)
+PINK_DARK = (205, 55, 119)
+
+TEXT_DARK = (37, 31, 43)
+TEXT_GRAY = (91, 84, 98)
+
+WHITE = (255, 255, 255)
+
+
+def load_font(size, bold=False):
+
+    if bold:
+
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+        ]
+
+    else:
+
+        candidates = [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        ]
+
+    for path in candidates:
+
+        if Path(path).exists():
+
+            return ImageFont.truetype(
+                path,
+                size=size,
+            )
+
+    return ImageFont.load_default()
+
+
+FONT_BRAND = load_font(31, True)
+FONT_NAME = load_font(54, True)
+FONT_INFO = load_font(32, False)
+
+FONT_ABOUT_TITLE = load_font(29, True)
+FONT_ABOUT = load_font(30, False)
+
+FONT_SMALL = load_font(23, False)
+FONT_COUNT = load_font(25, True)
+
+
+def make_gradient():
+
+    image = Image.new(
+        "RGB",
+        (CARD_WIDTH, CARD_HEIGHT),
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    top = (255, 212, 232)
+    middle = (233, 214, 255)
+    bottom = (203, 234, 255)
+
+    for y in range(CARD_HEIGHT):
+
+        ratio = y / CARD_HEIGHT
+
+        if ratio < 0.5:
+
+            local = ratio / 0.5
+
+            color = tuple(
+                int(
+                    top[i] * (1 - local)
+                    + middle[i] * local
+                )
+                for i in range(3)
+            )
+
+        else:
+
+            local = (ratio - 0.5) / 0.5
+
+            color = tuple(
+                int(
+                    middle[i] * (1 - local)
+                    + bottom[i] * local
+                )
+                for i in range(3)
+            )
+
+        draw.line(
+            (0, y, CARD_WIDTH, y),
+            fill=color,
+        )
+
+    return image
+
+
+def add_background_glow(image):
+
+    overlay = Image.new(
+        "RGBA",
+        image.size,
+        (0, 0, 0, 0),
+    )
+
+    draw = ImageDraw.Draw(overlay)
+
+    draw.ellipse(
+        (-120, 50, 420, 590),
+        fill=(255, 255, 255, 80),
+    )
+
+    draw.ellipse(
+        (720, -100, 1230, 410),
+        fill=(255, 255, 255, 65),
+    )
+
+    draw.ellipse(
+        (700, 1030, 1280, 1580),
+        fill=(255, 255, 255, 55),
+    )
+
+    overlay = overlay.filter(
+        ImageFilter.GaussianBlur(65)
+    )
+
+    return Image.alpha_composite(
+        image.convert("RGBA"),
+        overlay,
+    ).convert("RGB")
+
+
+def add_main_card(image):
+
+    shadow = Image.new(
+        "RGBA",
+        image.size,
+        (0, 0, 0, 0),
+    )
+
+    shadow_draw = ImageDraw.Draw(shadow)
+
+    shadow_draw.rounded_rectangle(
+        (55, 66, 1025, 1305),
+        radius=52,
+        fill=(0, 0, 0, 55),
+    )
+
+    shadow = shadow.filter(
+        ImageFilter.GaussianBlur(18)
+    )
+
+    base = Image.alpha_composite(
+        image.convert("RGBA"),
+        shadow,
+    )
+
+    overlay = Image.new(
+        "RGBA",
+        image.size,
+        (0, 0, 0, 0),
+    )
+
+    draw = ImageDraw.Draw(overlay)
+
+    draw.rounded_rectangle(
+        (47, 50, 1017, 1289),
+        radius=52,
+        fill=(255, 255, 255, 242),
+        outline=(255, 132, 185, 255),
+        width=6,
+    )
+
+    draw.rounded_rectangle(
+        (63, 66, 1001, 1273),
+        radius=43,
+        outline=(255, 214, 232, 255),
+        width=2,
+    )
+
+    return Image.alpha_composite(
+        base,
+        overlay,
+    ).convert("RGB")
+
+
+def crop_photo(
+    image,
+    width,
+    height,
+):
+
+    return ImageOps.fit(
+        image.convert("RGB"),
+        (width, height),
+        method=Image.Resampling.LANCZOS,
+        centering=(0.5, 0.45),
+    )
+
+
+def paste_round(
+    base,
+    picture,
+    x,
+    y,
+    width,
+    height,
+    radius=28,
+):
+
+    picture = crop_photo(
+        picture,
+        width,
+        height,
+    )
+
+    mask = Image.new(
+        "L",
+        (width, height),
+        0,
+    )
+
+    mask_draw = ImageDraw.Draw(mask)
+
+    mask_draw.rounded_rectangle(
+        (0, 0, width, height),
+        radius=radius,
+        fill=255,
+    )
+
+    base.paste(
+        picture,
+        (x, y),
+        mask,
+    )
+
+
+def make_video_tile(
+    width,
+    height,
+):
+
+    image = Image.new(
+        "RGB",
+        (width, height),
+        (232, 226, 242),
+    )
+
+    draw = ImageDraw.Draw(image)
+
+    center_x = width // 2
+    center_y = height // 2
+
+    radius = min(
+        width,
+        height,
+    ) // 8
+
+    draw.ellipse(
+        (
+            center_x - radius,
+            center_y - radius,
+            center_x + radius,
+            center_y + radius,
+        ),
+        fill=PINK,
+    )
+
+    draw.polygon(
+        [
+            (
+                center_x - radius // 4,
+                center_y - radius // 2,
+            ),
+            (
+                center_x - radius // 4,
+                center_y + radius // 2,
+            ),
+            (
+                center_x + radius // 2,
+                center_y,
+            ),
+        ],
+        fill=WHITE,
+    )
+
+    return image
+
+
+async def telegram_photo_to_pil(
+    bot,
+    file_id,
+):
+
+    try:
+
+        telegram_file = await bot.get_file(
+            file_id
+        )
+
+        buffer = io.BytesIO()
+
+        await telegram_file.download_to_memory(
+            out=buffer
+        )
+
+        buffer.seek(0)
+
+        return Image.open(
+            buffer
+        ).convert("RGB")
+
+    except Exception as error:
+
+        logger.warning(
+            "Cannot download photo %s: %s",
+            file_id,
+            error,
+        )
+
+        return None
+
+
+async def get_visual_tiles(
+    bot,
+    media,
+):
+
+    tiles = []
+
+    for item in media[:4]:
+
+        if item["media_type"] == "photo":
+
+            picture = await telegram_photo_to_pil(
+                bot,
+                item["file_id"],
+            )
+
+            if picture:
+
+                tiles.append(
+                    picture
+                )
+
+        elif item["media_type"] == "video":
+
+            tiles.append(
+                make_video_tile(
+                    500,
+                    500,
+                )
+            )
+
+    return tiles
+
+
+def render_collage(
+    base,
+    pictures,
+):
+
+    x = 92
+    y = 150
+
+    width = 896
+    height = 575
+
+    gap = 14
+
+    count = len(pictures)
+
+    if count == 0:
+
+        blank = Image.new(
+            "RGB",
+            (width, height),
+            (240, 235, 244),
+        )
+
+        paste_round(
+            base,
+            blank,
+            x,
+            y,
+            width,
+            height,
+            36,
+        )
+
+        return
+
+    if count == 1:
+
+        paste_round(
+            base,
+            pictures[0],
+            x,
+            y,
+            width,
+            height,
+            36,
+        )
+
+        return
+
+    if count == 2:
+
+        each_width = (
+            width - gap
+        ) // 2
+
+        paste_round(
+            base,
+            pictures[0],
+            x,
+            y,
+            each_width,
+            height,
+            32,
+        )
+
+        paste_round(
+            base,
+            pictures[1],
+            x + each_width + gap,
+            y,
+            each_width,
+            height,
+            32,
+        )
+
+        return
+
+    if count == 3:
+
+        left_width = 560
+
+        right_width = (
+            width
+            - left_width
+            - gap
+        )
+
+        half_height = (
+            height
+            - gap
+        ) // 2
+
+        paste_round(
+            base,
+            pictures[0],
+            x,
+            y,
+            left_width,
+            height,
+            32,
+        )
+
+        paste_round(
+            base,
+            pictures[1],
+            x + left_width + gap,
+            y,
+            right_width,
+            half_height,
+            28,
+        )
+
+        paste_round(
+            base,
+            pictures[2],
+            x + left_width + gap,
+            y + half_height + gap,
+            right_width,
+            half_height,
+            28,
+        )
+
+        return
+
+    half_width = (
+        width - gap
+    ) // 2
+
+    half_height = (
+        height - gap
+    ) // 2
+
+    positions = [
+        (x, y),
+
+        (
+            x + half_width + gap,
+            y,
+        ),
+
+        (
+            x,
+            y + half_height + gap,
+        ),
+
+        (
+            x + half_width + gap,
+            y + half_height + gap,
+        ),
+    ]
+
+    for picture, position in zip(
+        pictures[:4],
+        positions,
+    ):
+
+        paste_round(
+            base,
+            picture,
+            position[0],
+            position[1],
+            half_width,
+            half_height,
+            28,
+        )
+
+
+def split_text_by_pixels(
+    draw,
+    text,
+    font,
+    max_width,
+):
+
+    words = text.split()
+
+    if not words:
+        return []
+
+    lines = []
+    current = words[0]
+
+    for word in words[1:]:
+
+        trial = (
+            current
+            + " "
+            + word
+        )
+
+        box = draw.textbbox(
+            (0, 0),
+            trial,
+            font=font,
+        )
+
+        width = (
+            box[2]
+            - box[0]
+        )
+
+        if width <= max_width:
+
+            current = trial
+
+        else:
+
+            lines.append(
+                current
+            )
+
+            current = word
+
+    lines.append(
+        current
+    )
+
+    return lines
+
+
+async def generate_profile_card(
+    bot,
+    profile,
+):
+
+    media = await get_media(
+        profile["user_id"]
+    )
+
+    tiles = await get_visual_tiles(
+        bot,
+        media,
+    )
+
+    image = make_gradient()
+
+    image = add_background_glow(
+        image
+    )
+
+    image = add_main_card(
+        image
+    )
+
+    render_collage(
+        image,
+        tiles,
+    )
+
+    draw = ImageDraw.Draw(
+        image
+    )
+
+    # BRAND
+
+    brand = "OLIVKA MATCH"
+
+    brand_box = draw.textbbox(
+        (0, 0),
+        brand,
+        font=FONT_BRAND,
+    )
+
+    brand_width = (
+        brand_box[2]
+        - brand_box[0]
+    )
+
+    draw.rounded_rectangle(
+        (
+            92,
+            93,
+            92 + brand_width + 42,
+            134,
+        ),
+        radius=19,
+        fill=(255, 229, 241),
+    )
+
+    draw.text(
+        (113, 99),
+        brand,
+        font=FONT_BRAND,
+        fill=PINK_DARK,
+    )
+
+    # MEDIA COUNT
+
+    count_text = (
+        f"{len(media)}/{MAX_MEDIA}"
+    )
+
+    box = draw.textbbox(
+        (0, 0),
+        count_text,
+        font=FONT_COUNT,
+    )
+
+    count_width = (
+        box[2]
+        - box[0]
+    )
+
+    draw.rounded_rectangle(
+        (
+            920 - count_width,
+            665,
+            967,
+            705,
+        ),
+        radius=18,
+        fill=(35, 31, 43),
+    )
+
+    draw.text(
+        (
+            939 - count_width,
+            672,
+        ),
+        count_text,
+        font=FONT_COUNT,
+        fill=WHITE,
+    )
+
+    # NAME
+
+    name = str(
+        profile.get(
+            "name",
+            "Без имени",
+        )
+    )
+
+    age = str(
+        profile.get(
+            "age",
+            "",
+        )
+    )
+
+    title = (
+        f"{name}, {age}"
+    )
+
+    draw.text(
+        (92, 765),
+        title,
+        font=FONT_NAME,
+        fill=TEXT_DARK,
+    )
+
+    # INFO
+
+    city = str(
+        profile.get(
+            "city",
+            "",
+        )
+    )
+
+    gender = str(
+        profile.get(
+            "gender",
+            "",
+        )
+    )
+
+    gender = (
+        gender
+        .replace("👩 ", "")
+        .replace("👨 ", "")
+    )
+
+    looking = str(
+        profile.get(
+            "looking_for",
+            "",
+        )
+    )
+
+    looking = (
+        looking
+        .replace("👩 ", "")
+        .replace("👨 ", "")
+        .replace("💞 ", "")
+    )
+
+    info_lines = [
+        f"Город: {city}",
+        f"Пол: {gender}",
+        f"Ищу: {looking}",
+    ]
+
+    info_y = 840
+
+    for line in info_lines:
+
+        draw.text(
+            (94, info_y),
+            line,
+            font=FONT_INFO,
+            fill=TEXT_GRAY,
+        )
+
+        info_y += 45
+
+    # ABOUT
+
+    draw.text(
+        (92, 992),
+        "О СЕБЕ",
+        font=FONT_ABOUT_TITLE,
+        fill=PINK_DARK,
+    )
+
+    about = str(
+        profile.get(
+            "about",
+            "",
+        )
+    ).strip()
+
+    about_lines = split_text_by_pixels(
+        draw,
+        about,
+        FONT_ABOUT,
+        870,
+    )
+
+    about_y = 1038
+
+    for line in about_lines[:4]:
+
+        draw.text(
+            (92, about_y),
+            line,
+            font=FONT_ABOUT,
+            fill=TEXT_DARK,
+        )
+
+        about_y += 42
+
+    # FOOTER
+
+    footer = (
+        "Знакомства • Симпатии • Match"
+    )
+
+    footer_box = draw.textbbox(
+        (0, 0),
+        footer,
+        font=FONT_SMALL,
+    )
+
+    footer_width = (
+        footer_box[2]
+        - footer_box[0]
+    )
+
+    draw.text(
+        (
+            CARD_WIDTH
+            - 92
+            - footer_width,
+            1235,
+        ),
+        footer,
+        font=FONT_SMALL,
+        fill=(150, 141, 155),
+    )
+
+    output = io.BytesIO()
+
+    output.name = (
+        "olivka_match_profile.jpg"
+    )
+
+    image.save(
+        output,
+        format="JPEG",
+        quality=94,
+        optimize=True,
+    )
+
+    output.seek(0)
+
+    return output
+
+
+# ============================================================
 # DATABASE
 # ============================================================
 
 async def init_database():
+
     global db_pool
 
     db_pool = await asyncpg.create_pool(
@@ -135,7 +994,10 @@ async def init_database():
                 from_user BIGINT NOT NULL,
                 to_user BIGINT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (from_user, to_user)
+                PRIMARY KEY (
+                    from_user,
+                    to_user
+                )
             )
             """
         )
@@ -146,25 +1008,28 @@ async def init_database():
                 from_user BIGINT NOT NULL,
                 to_user BIGINT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (from_user, to_user)
+                PRIMARY KEY (
+                    from_user,
+                    to_user
+                )
             )
             """
         )
 
-        # Отдельная таблица реальных мэтчей.
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS matches (
                 user1 BIGINT NOT NULL,
                 user2 BIGINT NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user1, user2)
+                PRIMARY KEY (
+                    user1,
+                    user2
+                )
             )
             """
         )
 
-        # Помнит, кому бот уже автоматически
-        # отправлял конкретную анкету.
         await conn.execute(
             """
             CREATE TABLE IF NOT EXISTS profile_deliveries (
@@ -179,7 +1044,7 @@ async def init_database():
             """
         )
 
-        # Перенос старого главного фото в галерею.
+        # Старые фото переносим в media.
         await conn.execute(
             """
             INSERT INTO profile_media (
@@ -188,30 +1053,42 @@ async def init_database():
                 file_id,
                 sort_order
             )
+
             SELECT
                 p.user_id,
                 'photo',
                 p.photo,
                 0
+
             FROM profiles p
-            WHERE p.photo IS NOT NULL
-              AND p.photo <> ''
-              AND NOT EXISTS (
+
+            WHERE
+                p.photo IS NOT NULL
+
+                AND p.photo <> ''
+
+                AND NOT EXISTS (
+
                     SELECT 1
+
                     FROM profile_media pm
-                    WHERE pm.user_id = p.user_id
-              )
+
+                    WHERE
+                        pm.user_id
+                        = p.user_id
+                )
             """
         )
 
-    logger.info("Database initialized")
+    logger.info(
+        "Database initialized"
+    )
 
 
-# ============================================================
-# PROFILE DATABASE
-# ============================================================
+async def get_profile(
+    user_id,
+):
 
-async def get_profile(user_id):
     async with db_pool.acquire() as conn:
 
         row = await conn.fetchrow(
@@ -229,7 +1106,10 @@ async def get_profile(user_id):
     return dict(row)
 
 
-async def save_profile(profile):
+async def save_profile(
+    profile,
+):
+
     async with db_pool.acquire() as conn:
 
         await conn.execute(
@@ -245,23 +1125,44 @@ async def save_profile(profile):
                 about,
                 photo
             )
+
             VALUES (
-                $1,$2,$3,$4,$5,$6,$7,$8,$9
+                $1,$2,$3,$4,$5,
+                $6,$7,$8,$9
             )
 
             ON CONFLICT (user_id)
+
             DO UPDATE SET
 
-                username = EXCLUDED.username,
-                name = EXCLUDED.name,
-                age = EXCLUDED.age,
-                city = EXCLUDED.city,
-                gender = EXCLUDED.gender,
-                looking_for = EXCLUDED.looking_for,
-                about = EXCLUDED.about,
-                photo = EXCLUDED.photo,
-                updated_at = CURRENT_TIMESTAMP
+                username =
+                    EXCLUDED.username,
+
+                name =
+                    EXCLUDED.name,
+
+                age =
+                    EXCLUDED.age,
+
+                city =
+                    EXCLUDED.city,
+
+                gender =
+                    EXCLUDED.gender,
+
+                looking_for =
+                    EXCLUDED.looking_for,
+
+                about =
+                    EXCLUDED.about,
+
+                photo =
+                    EXCLUDED.photo,
+
+                updated_at =
+                    CURRENT_TIMESTAMP
             """,
+
             profile["user_id"],
             profile["username"],
             profile["name"],
@@ -274,11 +1175,35 @@ async def save_profile(profile):
         )
 
 
+async def update_username(
+    user_id,
+    username,
+):
+
+    async with db_pool.acquire() as conn:
+
+        await conn.execute(
+            """
+            UPDATE profiles
+
+            SET
+                username = $1,
+                updated_at =
+                    CURRENT_TIMESTAMP
+
+            WHERE user_id = $2
+            """,
+            username,
+            user_id,
+        )
+
+
 async def update_profile_field(
     user_id,
     field,
     value,
 ):
+
     allowed = {
         "name",
         "age",
@@ -293,8 +1218,12 @@ async def update_profile_field(
 
     query = f"""
         UPDATE profiles
-        SET {field} = $1,
-            updated_at = CURRENT_TIMESTAMP
+
+        SET
+            {field} = $1,
+            updated_at =
+                CURRENT_TIMESTAMP
+
         WHERE user_id = $2
     """
 
@@ -308,10 +1237,12 @@ async def update_profile_field(
 
 
 # ============================================================
-# MEDIA DATABASE
+# MEDIA
 # ============================================================
 
-async def get_media(user_id):
+async def get_media(
+    user_id,
+):
 
     async with db_pool.acquire() as conn:
 
@@ -322,8 +1253,11 @@ async def get_media(user_id):
                 media_type,
                 file_id,
                 sort_order
+
             FROM profile_media
+
             WHERE user_id = $1
+
             ORDER BY
                 sort_order ASC,
                 id ASC
@@ -348,9 +1282,8 @@ async def add_media(
     )
 
     if len(current) >= MAX_MEDIA:
-        return False
 
-    sort_order = len(current)
+        return False
 
     async with db_pool.acquire() as conn:
 
@@ -362,12 +1295,15 @@ async def add_media(
                 file_id,
                 sort_order
             )
-            VALUES ($1,$2,$3,$4)
+
+            VALUES (
+                $1,$2,$3,$4
+            )
             """,
             user_id,
             media_type,
             file_id,
-            sort_order,
+            len(current),
         )
 
     return True
@@ -377,10 +1313,9 @@ async def replace_with_first_photo(
     user_id,
     file_id,
 ):
-    """
-    Главное фото никогда не превращаем в NULL.
-    Это важно для старой базы, где photo = NOT NULL.
-    """
+
+    # photo в старой базе NOT NULL.
+    # Поэтому никогда не ставим photo = NULL.
 
     async with db_pool.acquire() as conn:
 
@@ -389,6 +1324,7 @@ async def replace_with_first_photo(
             await conn.execute(
                 """
                 DELETE FROM profile_media
+
                 WHERE user_id = $1
                 """,
                 user_id,
@@ -402,6 +1338,7 @@ async def replace_with_first_photo(
                     file_id,
                     sort_order
                 )
+
                 VALUES (
                     $1,
                     'photo',
@@ -416,8 +1353,12 @@ async def replace_with_first_photo(
             await conn.execute(
                 """
                 UPDATE profiles
-                SET photo = $1,
-                    updated_at = CURRENT_TIMESTAMP
+
+                SET
+                    photo = $1,
+                    updated_at =
+                        CURRENT_TIMESTAMP
+
                 WHERE user_id = $2
                 """,
                 file_id,
@@ -426,14 +1367,17 @@ async def replace_with_first_photo(
 
 
 async def delete_last_media(
-    user_id
+    user_id,
 ):
+
     media = await get_media(
         user_id
     )
 
-    # Главное фото оставляем.
+    # Всегда оставляем главное фото.
+
     if len(media) <= 1:
+
         return False
 
     last = media[-1]
@@ -443,6 +1387,7 @@ async def delete_last_media(
         await conn.execute(
             """
             DELETE FROM profile_media
+
             WHERE id = $1
             """,
             last["id"],
@@ -452,7 +1397,7 @@ async def delete_last_media(
 
 
 # ============================================================
-# LIKES / SKIPS / MATCHES
+# LIKES
 # ============================================================
 
 async def add_like(
@@ -468,21 +1413,23 @@ async def add_like(
                 from_user,
                 to_user
             )
+
             VALUES ($1,$2)
-            ON CONFLICT DO NOTHING
+
+            ON CONFLICT
+            DO NOTHING
             """,
             from_user,
             to_user,
         )
 
-        # Если раньше человек нажал "пропустить",
-        # а теперь somehow поставил лайк —
-        # пропуск убираем.
         await conn.execute(
             """
             DELETE FROM skips
-            WHERE from_user = $1
-              AND to_user = $2
+
+            WHERE
+                from_user = $1
+                AND to_user = $2
             """,
             from_user,
             to_user,
@@ -502,8 +1449,11 @@ async def add_skip(
                 from_user,
                 to_user
             )
+
             VALUES ($1,$2)
-            ON CONFLICT DO NOTHING
+
+            ON CONFLICT
+            DO NOTHING
             """,
             from_user,
             to_user,
@@ -514,13 +1464,6 @@ async def create_match_if_mutual(
     user_a,
     user_b,
 ):
-    """
-    Возвращает True ТОЛЬКО если:
-
-    1. user_a лайкнул user_b
-    2. user_b лайкнул user_a
-    3. такой MATCH ещё не создавался
-    """
 
     first = min(
         user_a,
@@ -539,10 +1482,14 @@ async def create_match_if_mutual(
             a_likes_b = await conn.fetchval(
                 """
                 SELECT EXISTS (
+
                     SELECT 1
+
                     FROM likes
-                    WHERE from_user = $1
-                      AND to_user = $2
+
+                    WHERE
+                        from_user = $1
+                        AND to_user = $2
                 )
                 """,
                 user_a,
@@ -552,10 +1499,14 @@ async def create_match_if_mutual(
             b_likes_a = await conn.fetchval(
                 """
                 SELECT EXISTS (
+
                     SELECT 1
+
                     FROM likes
-                    WHERE from_user = $1
-                      AND to_user = $2
+
+                    WHERE
+                        from_user = $1
+                        AND to_user = $2
                 )
                 """,
                 user_b,
@@ -566,17 +1517,20 @@ async def create_match_if_mutual(
                 a_likes_b
                 and b_likes_a
             ):
+
                 return False
 
-            new_match = await conn.fetchrow(
+            created = await conn.fetchrow(
                 """
                 INSERT INTO matches (
                     user1,
                     user2
                 )
+
                 VALUES ($1,$2)
 
-                ON CONFLICT DO NOTHING
+                ON CONFLICT
+                DO NOTHING
 
                 RETURNING
                     user1,
@@ -586,12 +1540,120 @@ async def create_match_if_mutual(
                 second,
             )
 
-            # None = мэтч уже был раньше.
-            return new_match is not None
+            return (
+                created is not None
+            )
+
+
+async def get_people_who_liked_me(
+    user_id,
+):
+
+    async with db_pool.acquire() as conn:
+
+        rows = await conn.fetch(
+            """
+            SELECT p.*
+
+            FROM likes l
+
+            JOIN profiles p
+                ON p.user_id =
+                    l.from_user
+
+            WHERE
+                l.to_user = $1
+
+                AND NOT EXISTS (
+
+                    SELECT 1
+
+                    FROM likes reverse_like
+
+                    WHERE
+                        reverse_like.from_user
+                            = $1
+
+                        AND
+                        reverse_like.to_user
+                            = l.from_user
+                )
+
+                AND NOT EXISTS (
+
+                    SELECT 1
+
+                    FROM skips s
+
+                    WHERE
+                        s.from_user = $1
+
+                        AND
+                        s.to_user =
+                            l.from_user
+                )
+
+            ORDER BY
+                l.created_at DESC
+            """,
+            user_id,
+        )
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+
+async def get_my_matches(
+    user_id,
+):
+
+    async with db_pool.acquire() as conn:
+
+        rows = await conn.fetch(
+            """
+            SELECT
+                p.*,
+                m.created_at
+                    AS match_created_at
+
+            FROM matches m
+
+            JOIN profiles p
+
+            ON p.user_id =
+
+                CASE
+
+                    WHEN m.user1 = $1
+                    THEN m.user2
+
+                    ELSE m.user1
+
+                END
+
+            WHERE
+                m.user1 = $1
+                OR m.user2 = $1
+
+            ORDER BY
+                m.created_at DESC
+
+            LIMIT $2
+            """,
+            user_id,
+            MAX_MATCHES_TO_SHOW,
+        )
+
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
-# AUTO DELIVERY
+# DELIVERIES
 # ============================================================
 
 async def already_delivered(
@@ -604,10 +1666,16 @@ async def already_delivered(
         result = await conn.fetchval(
             """
             SELECT EXISTS (
+
                 SELECT 1
+
                 FROM profile_deliveries
-                WHERE recipient_user = $1
-                  AND profile_user = $2
+
+                WHERE
+                    recipient_user = $1
+
+                    AND
+                    profile_user = $2
             )
             """,
             recipient_user,
@@ -630,8 +1698,11 @@ async def mark_delivered(
                 recipient_user,
                 profile_user
             )
+
             VALUES ($1,$2)
-            ON CONFLICT DO NOTHING
+
+            ON CONFLICT
+            DO NOTHING
             """,
             recipient_user,
             profile_user,
@@ -643,7 +1714,7 @@ async def mark_delivered(
 # ============================================================
 
 async def delete_profile(
-    user_id
+    user_id,
 ):
 
     async with db_pool.acquire() as conn:
@@ -661,8 +1732,10 @@ async def delete_profile(
             await conn.execute(
                 """
                 DELETE FROM likes
-                WHERE from_user = $1
-                   OR to_user = $1
+
+                WHERE
+                    from_user = $1
+                    OR to_user = $1
                 """,
                 user_id,
             )
@@ -670,8 +1743,10 @@ async def delete_profile(
             await conn.execute(
                 """
                 DELETE FROM skips
-                WHERE from_user = $1
-                   OR to_user = $1
+
+                WHERE
+                    from_user = $1
+                    OR to_user = $1
                 """,
                 user_id,
             )
@@ -679,8 +1754,10 @@ async def delete_profile(
             await conn.execute(
                 """
                 DELETE FROM matches
-                WHERE user1 = $1
-                   OR user2 = $1
+
+                WHERE
+                    user1 = $1
+                    OR user2 = $1
                 """,
                 user_id,
             )
@@ -688,8 +1765,10 @@ async def delete_profile(
             await conn.execute(
                 """
                 DELETE FROM profile_deliveries
-                WHERE recipient_user = $1
-                   OR profile_user = $1
+
+                WHERE
+                    recipient_user = $1
+                    OR profile_user = $1
                 """,
                 user_id,
             )
@@ -697,6 +1776,7 @@ async def delete_profile(
             await conn.execute(
                 """
                 DELETE FROM profiles
+
                 WHERE user_id = $1
                 """,
                 user_id,
@@ -713,15 +1793,18 @@ def gender_matches(
 ):
 
     if looking_for == "💞 Неважно":
+
         return True
 
     if looking_for == "👩 Девушку":
+
         return (
             candidate_gender
             == "👩 Девушка"
         )
 
     if looking_for == "👨 Мужчину":
+
         return (
             candidate_gender
             == "👨 Мужчина"
@@ -731,29 +1814,23 @@ def gender_matches(
 
 
 def candidate_accepts(
-    candidate_looking_for,
+    looking_for,
     viewer_gender,
 ):
 
-    if (
-        candidate_looking_for
-        == "💞 Неважно"
-    ):
+    if looking_for == "💞 Неважно":
+
         return True
 
-    if (
-        candidate_looking_for
-        == "👩 Девушку"
-    ):
+    if looking_for == "👩 Девушку":
+
         return (
             viewer_gender
             == "👩 Девушка"
         )
 
-    if (
-        candidate_looking_for
-        == "👨 Мужчину"
-    ):
+    if looking_for == "👨 Мужчину":
+
         return (
             viewer_gender
             == "👨 Мужчина"
@@ -772,7 +1849,9 @@ def profiles_are_compatible(
             profile_a["looking_for"],
             profile_b["gender"],
         )
+
         and
+
         candidate_accepts(
             profile_b["looking_for"],
             profile_a["gender"],
@@ -780,12 +1859,8 @@ def profiles_are_compatible(
     )
 
 
-# ============================================================
-# FIND PROFILES
-# ============================================================
-
 async def get_next_profile(
-    user_id
+    user_id,
 ):
 
     viewer = await get_profile(
@@ -793,6 +1868,7 @@ async def get_next_profile(
     )
 
     if not viewer:
+
         return None
 
     async with db_pool.acquire() as conn:
@@ -800,23 +1876,39 @@ async def get_next_profile(
         rows = await conn.fetch(
             """
             SELECT p.*
+
             FROM profiles p
 
-            WHERE p.user_id <> $1
+            WHERE
+                p.user_id <> $1
 
-            AND NOT EXISTS (
-                SELECT 1
-                FROM likes l
-                WHERE l.from_user = $1
-                  AND l.to_user = p.user_id
-            )
+                AND NOT EXISTS (
 
-            AND NOT EXISTS (
-                SELECT 1
-                FROM skips s
-                WHERE s.from_user = $1
-                  AND s.to_user = p.user_id
-            )
+                    SELECT 1
+
+                    FROM likes l
+
+                    WHERE
+                        l.from_user = $1
+
+                        AND
+                        l.to_user =
+                            p.user_id
+                )
+
+                AND NOT EXISTS (
+
+                    SELECT 1
+
+                    FROM skips s
+
+                    WHERE
+                        s.from_user = $1
+
+                        AND
+                        s.to_user =
+                            p.user_id
+                )
 
             ORDER BY
                 p.updated_at DESC
@@ -830,27 +1922,27 @@ async def get_next_profile(
 
         candidate = dict(row)
 
-        media = await get_media(
-            candidate["user_id"]
-        )
-
-        if not media:
-            continue
-
         if not profiles_are_compatible(
             viewer,
             candidate,
         ):
+
             continue
 
-        return candidate
+        media = await get_media(
+            candidate["user_id"]
+        )
+
+        if media:
+
+            return candidate
 
     return None
 
 
-async def get_compatible_profiles_for_user(
+async def compatible_profiles(
     user_id,
-    limit=None,
+    limit=3,
 ):
 
     viewer = await get_profile(
@@ -858,6 +1950,7 @@ async def get_compatible_profiles_for_user(
     )
 
     if not viewer:
+
         return []
 
     async with db_pool.acquire() as conn:
@@ -865,9 +1958,14 @@ async def get_compatible_profiles_for_user(
         rows = await conn.fetch(
             """
             SELECT *
+
             FROM profiles
-            WHERE user_id <> $1
-            ORDER BY updated_at DESC
+
+            WHERE
+                user_id <> $1
+
+            ORDER BY
+                updated_at DESC
             """,
             user_id,
         )
@@ -882,6 +1980,7 @@ async def get_compatible_profiles_for_user(
             viewer,
             candidate,
         ):
+
             continue
 
         media = await get_media(
@@ -889,16 +1988,15 @@ async def get_compatible_profiles_for_user(
         )
 
         if not media:
+
             continue
 
         result.append(
             candidate
         )
 
-        if (
-            limit is not None
-            and len(result) >= limit
-        ):
+        if len(result) >= limit:
+
             break
 
     return result
@@ -915,12 +2013,32 @@ def main_menu():
             [
                 "🔥 Смотреть анкеты"
             ],
+
+            [
+                "💌 Кто меня лайкнул",
+                "💞 Мои мэтчи",
+            ],
+
             [
                 "👤 Моя анкета",
-                "✏️ Редактировать анкету",
+                "✏️ Редактировать",
+            ],
+
+            [
+                "ℹ️ Помощь"
             ],
         ],
+
         resize_keyboard=True,
+
+        # Главное:
+        is_persistent=True,
+
+        one_time_keyboard=False,
+
+        input_field_placeholder=(
+            "Выбери действие 💗"
+        ),
     )
 
 
@@ -930,9 +2048,22 @@ def create_menu():
         [
             [
                 "💘 Создать анкету"
-            ]
+            ],
+
+            [
+                "ℹ️ Помощь"
+            ],
         ],
+
         resize_keyboard=True,
+
+        is_persistent=True,
+
+        one_time_keyboard=False,
+
+        input_field_placeholder=(
+            "Создай анкету 💗"
+        ),
     )
 
 
@@ -954,9 +2085,17 @@ def looking_keyboard():
 
     return ReplyKeyboardMarkup(
         [
-            ["👩 Девушку"],
-            ["👨 Мужчину"],
-            ["💞 Неважно"],
+            [
+                "👩 Девушку"
+            ],
+
+            [
+                "👨 Мужчину"
+            ],
+
+            [
+                "💞 Неважно"
+            ],
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
@@ -972,6 +2111,7 @@ def edit_menu():
                     "👤 Имя",
                     callback_data="edit:name",
                 ),
+
                 InlineKeyboardButton(
                     "🎂 Возраст",
                     callback_data="edit:age",
@@ -983,6 +2123,7 @@ def edit_menu():
                     "📍 Город",
                     callback_data="edit:city",
                 ),
+
                 InlineKeyboardButton(
                     "🚻 Пол",
                     callback_data="edit:gender",
@@ -1035,28 +2176,28 @@ def media_menu():
                 InlineKeyboardButton(
                     "➕ Добавить фото/видео",
                     callback_data="media:add",
-                ),
+                )
             ],
 
             [
                 InlineKeyboardButton(
                     "🗑 Удалить последнее",
                     callback_data="media:delete_last",
-                ),
+                )
             ],
 
             [
                 InlineKeyboardButton(
                     "⬅️ Назад",
                     callback_data="media:back",
-                ),
+                )
             ],
         ]
     )
 
 
 def like_keyboard(
-    profile_user_id
+    profile_id,
 ):
 
     return InlineKeyboardMarkup(
@@ -1065,14 +2206,14 @@ def like_keyboard(
                 InlineKeyboardButton(
                     "👎 Пропустить",
                     callback_data=(
-                        f"skip:{profile_user_id}"
+                        f"skip:{profile_id}"
                     ),
                 ),
 
                 InlineKeyboardButton(
                     "❤️ Нравится",
                     callback_data=(
-                        f"like:{profile_user_id}"
+                        f"like:{profile_id}"
                     ),
                 ),
             ]
@@ -1081,40 +2222,35 @@ def like_keyboard(
 
 
 def contact_keyboard(
-    profile
+    profile,
 ):
+
     username = profile.get(
         "username"
     )
 
     if username:
 
-        return InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "💬 Написать",
-                        url=(
-                            f"https://t.me/"
-                            f"{username}"
-                        ),
-                    )
-                ]
-            ]
+        link = (
+            "https://t.me/"
+            + username
         )
 
-    # Если username у человека нет,
-    # Telegram всё равно умеет открыть пользователя
-    # по tg://user?id=...
+    else:
+
+        link = (
+            "tg://user?id="
+            + str(
+                profile["user_id"]
+            )
+        )
+
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
                     "💬 Написать",
-                    url=(
-                        "tg://user?id="
-                        f"{profile['user_id']}"
-                    ),
+                    url=link,
                 )
             ]
         ]
@@ -1122,37 +2258,62 @@ def contact_keyboard(
 
 
 # ============================================================
-# PROFILE TEXT
+# SEND PROFILE
 # ============================================================
 
-def profile_caption(
-    profile
+async def send_profile_card(
+    bot,
+    chat_id,
+    profile,
 ):
 
-    return (
-        f"💗 <b>"
-        f"{escape(profile['name'])}, "
-        f"{profile['age']}"
-        f"</b>\n"
+    try:
 
-        f"📍 "
-        f"{escape(profile['city'])}\n"
+        card = await generate_profile_card(
+            bot,
+            profile,
+        )
 
-        f"{escape(profile['gender'])}\n"
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=card,
+        )
 
-        f"🔎 Ищу: "
-        f"{escape(profile['looking_for'])}\n\n"
+    except Exception as error:
 
-        f"✨ "
-        f"{escape(profile['about'])}"
-    )
+        logger.exception(
+            "Card generation error: %s",
+            error,
+        )
+
+        # Если Pillow-карточка не собралась,
+        # показываем обычную фотографию.
+
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=profile["photo"],
+            caption=(
+                f"💗 <b>"
+                f"{escape(profile['name'])}, "
+                f"{profile['age']}"
+                f"</b>\n"
+
+                f"📍 "
+                f"{escape(profile['city'])}\n"
+
+                f"{escape(profile['gender'])}\n"
+
+                f"🔎 Ищу: "
+                f"{escape(profile['looking_for'])}\n\n"
+
+                f"✨ "
+                f"{escape(profile['about'])}"
+            ),
+            parse_mode="HTML",
+        )
 
 
-# ============================================================
-# SEND PROFILE ALBUM
-# ============================================================
-
-async def send_profile_album(
+async def send_extra_real_media(
     bot,
     chat_id,
     profile,
@@ -1162,162 +2323,96 @@ async def send_profile_album(
         profile["user_id"]
     )
 
-    caption = profile_caption(
-        profile
-    )
+    extras = []
 
-    if not media:
-
-        if profile.get("photo"):
-
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=profile["photo"],
-                caption=caption,
-                parse_mode="HTML",
-            )
-
-        else:
-
-            await bot.send_message(
-                chat_id=chat_id,
-                text=caption,
-                parse_mode="HTML",
-            )
-
-        return
-
-    # Один файл.
-    if len(media) == 1:
-
-        item = media[0]
-
-        if (
-            item["media_type"]
-            == "photo"
-        ):
-
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=item["file_id"],
-                caption=caption,
-                parse_mode="HTML",
-            )
-
-        else:
-
-            await bot.send_video(
-                chat_id=chat_id,
-                video=item["file_id"],
-                caption=caption,
-                parse_mode="HTML",
-            )
-
-        return
-
-    # Несколько файлов = Telegram-альбом.
-    album = []
+    # Первые 4 фото уже находятся
+    # внутри дизайнерской карточки.
+    # Видео оставляем настоящими.
+    # 5-е и 6-е фото тоже показываем отдельно.
 
     for index, item in enumerate(
-        media[:MAX_MEDIA]
+        media
     ):
 
-        item_caption = (
-            caption
-            if index == 0
-            else None
-        )
+        if item["media_type"] == "video":
 
-        item_parse_mode = (
-            "HTML"
-            if index == 0
-            else None
-        )
-
-        if (
-            item["media_type"]
-            == "photo"
-        ):
-
-            album.append(
-                InputMediaPhoto(
-                    media=item["file_id"],
-                    caption=item_caption,
-                    parse_mode=item_parse_mode,
+            extras.append(
+                InputMediaVideo(
+                    media=item["file_id"]
                 )
             )
 
         elif (
-            item["media_type"]
-            == "video"
+            item["media_type"] == "photo"
+            and index >= 4
         ):
 
-            album.append(
-                InputMediaVideo(
-                    media=item["file_id"],
-                    caption=item_caption,
-                    parse_mode=item_parse_mode,
+            extras.append(
+                InputMediaPhoto(
+                    media=item["file_id"]
                 )
             )
 
+    if not extras:
+
+        return
+
     try:
 
-        await bot.send_media_group(
-            chat_id=chat_id,
-            media=album,
-        )
+        if len(extras) == 1:
 
-    except Exception as error:
+            item = extras[0]
 
-        logger.exception(
-            "Album error: %s",
-            error,
-        )
-
-        # Запасной режим.
-        for index, item in enumerate(
-            media[:MAX_MEDIA]
-        ):
-
-            item_caption = (
-                caption
-                if index == 0
-                else None
-            )
-
-            if (
-                item["media_type"]
-                == "photo"
+            if isinstance(
+                item,
+                InputMediaVideo,
             ):
 
-                await bot.send_photo(
+                await bot.send_video(
                     chat_id=chat_id,
-                    photo=item["file_id"],
-                    caption=item_caption,
-                    parse_mode=(
-                        "HTML"
-                        if item_caption
-                        else None
-                    ),
+                    video=item.media,
                 )
 
             else:
 
-                await bot.send_video(
+                await bot.send_photo(
                     chat_id=chat_id,
-                    video=item["file_id"],
-                    caption=item_caption,
-                    parse_mode=(
-                        "HTML"
-                        if item_caption
-                        else None
-                    ),
+                    photo=item.media,
                 )
 
+        else:
 
-# ============================================================
-# SEND PROFILE WITH LIKE BUTTONS
-# ============================================================
+            await bot.send_media_group(
+                chat_id=chat_id,
+                media=extras,
+            )
+
+    except Exception as error:
+
+        logger.warning(
+            "Extra media error: %s",
+            error,
+        )
+
+
+async def send_profile_display(
+    bot,
+    chat_id,
+    profile,
+):
+
+    await send_profile_card(
+        bot,
+        chat_id,
+        profile,
+    )
+
+    await send_extra_real_media(
+        bot,
+        chat_id,
+        profile,
+    )
+
 
 async def send_profile_for_choice(
     bot,
@@ -1333,7 +2428,7 @@ async def send_profile_for_choice(
             text=header,
         )
 
-    await send_profile_album(
+    await send_profile_display(
         bot,
         chat_id,
         profile,
@@ -1349,7 +2444,7 @@ async def send_profile_for_choice(
 
 
 # ============================================================
-# AUTOMATIC PROFILE DELIVERY
+# AUTOMATIC PROFILES
 # ============================================================
 
 async def send_initial_profiles(
@@ -1357,28 +2452,18 @@ async def send_initial_profiles(
     user_id,
 ):
 
-    """
-    После создания анкеты новый пользователь
-    автоматически получает несколько
-    существующих подходящих анкет.
-    """
-
-    profiles = (
-        await
-        get_compatible_profiles_for_user(
-            user_id,
-            limit=INITIAL_AUTO_PROFILES,
-        )
+    profiles = await compatible_profiles(
+        user_id,
+        INITIAL_AUTO_PROFILES,
     )
 
     for profile in profiles:
 
-        delivered = await already_delivered(
+        if await already_delivered(
             user_id,
             profile["user_id"],
-        )
+        ):
 
-        if delivered:
             continue
 
         try:
@@ -1388,8 +2473,8 @@ async def send_initial_profiles(
                 user_id,
                 profile,
                 header=(
-                    "🔥 Нашла подходящую "
-                    "анкету для тебя"
+                    "🔥 Подходящая "
+                    "анкета для тебя"
                 ),
             )
 
@@ -1400,28 +2485,23 @@ async def send_initial_profiles(
 
         except Exception as error:
 
-            logger.exception(
-                "Initial delivery failed: %s",
+            logger.warning(
+                "Auto profile error: %s",
                 error,
             )
 
 
-async def notify_users_about_new_profile(
+async def notify_about_new_profile(
     bot,
     new_user_id,
 ):
-
-    """
-    Когда новый человек зарегистрировался,
-    его анкета автоматически приходит
-    подходящим существующим пользователям.
-    """
 
     newcomer = await get_profile(
         new_user_id
     )
 
     if not newcomer:
+
         return
 
     async with db_pool.acquire() as conn:
@@ -1429,8 +2509,11 @@ async def notify_users_about_new_profile(
         rows = await conn.fetch(
             """
             SELECT *
+
             FROM profiles
-            WHERE user_id <> $1
+
+            WHERE
+                user_id <> $1
             """,
             new_user_id,
         )
@@ -1443,14 +2526,14 @@ async def notify_users_about_new_profile(
             recipient,
             newcomer,
         ):
+
             continue
 
-        delivered = await already_delivered(
+        if await already_delivered(
             recipient["user_id"],
             newcomer["user_id"],
-        )
+        ):
 
-        if delivered:
             continue
 
         try:
@@ -1472,16 +2555,14 @@ async def notify_users_about_new_profile(
 
         except Exception as error:
 
-            # Например пользователь заблокировал бота.
             logger.warning(
-                "Cannot deliver profile to %s: %s",
-                recipient["user_id"],
+                "New profile delivery: %s",
                 error,
             )
 
 
 # ============================================================
-# MATCH NOTIFICATION
+# MATCH
 # ============================================================
 
 async def send_match_notifications(
@@ -1498,28 +2579,25 @@ async def send_match_notifications(
         user_b
     )
 
-    if (
-        not profile_a
-        or not profile_b
-    ):
+    if not profile_a or not profile_b:
+
         return
 
-    # ---------- A получает B ----------
+    # A получает B.
 
     try:
 
         await bot.send_message(
             chat_id=user_a,
             text=(
-                "💞💞💞 "
-                "<b>ЭТО MATCH!</b> "
-                "💞💞💞\n\n"
-                "Вы понравились друг другу ❤️"
+                "💞 <b>ЭТО MATCH!</b> 💞\n\n"
+                "Вы понравились "
+                "друг другу ❤️"
             ),
             parse_mode="HTML",
         )
 
-        await send_profile_album(
+        await send_profile_display(
             bot,
             user_a,
             profile_b,
@@ -1529,7 +2607,7 @@ async def send_match_notifications(
             chat_id=user_a,
             text=(
                 "🔥 Симпатия взаимна!\n"
-                "Можно знакомиться 😏"
+                "Самое время познакомиться."
             ),
             reply_markup=contact_keyboard(
                 profile_b
@@ -1539,26 +2617,25 @@ async def send_match_notifications(
     except Exception as error:
 
         logger.exception(
-            "Match notify A failed: %s",
+            "Match A error: %s",
             error,
         )
 
-    # ---------- B получает A ----------
+    # B получает A.
 
     try:
 
         await bot.send_message(
             chat_id=user_b,
             text=(
-                "💞💞💞 "
-                "<b>ЭТО MATCH!</b> "
-                "💞💞💞\n\n"
-                "Вы понравились друг другу ❤️"
+                "💞 <b>ЭТО MATCH!</b> 💞\n\n"
+                "Вы понравились "
+                "друг другу ❤️"
             ),
             parse_mode="HTML",
         )
 
-        await send_profile_album(
+        await send_profile_display(
             bot,
             user_b,
             profile_a,
@@ -1568,7 +2645,7 @@ async def send_match_notifications(
             chat_id=user_b,
             text=(
                 "🔥 Симпатия взаимна!\n"
-                "Можно знакомиться 😏"
+                "Самое время познакомиться."
             ),
             reply_markup=contact_keyboard(
                 profile_a
@@ -1578,13 +2655,13 @@ async def send_match_notifications(
     except Exception as error:
 
         logger.exception(
-            "Match notify B failed: %s",
+            "Match B error: %s",
             error,
         )
 
 
 # ============================================================
-# START
+# START / HELP
 # ============================================================
 
 async def start(
@@ -1598,22 +2675,72 @@ async def start(
 
     if profile:
 
+        await update_username(
+            update.effective_user.id,
+            update.effective_user.username,
+        )
+
         await update.message.reply_text(
-            "💗 Добро пожаловать "
-            "в OLIVKA MATCH!\n\n"
-            "Твоя анкета на месте ✅",
+            (
+                "💗 Добро пожаловать "
+                "в OLIVKA MATCH!\n\n"
+                "Главное меню теперь "
+                "всегда под рукой 👇"
+            ),
             reply_markup=main_menu(),
         )
 
     else:
 
         await update.message.reply_text(
-            "💗 Добро пожаловать "
-            "в OLIVKA MATCH!\n\n"
-            "Создай анкету и "
-            "начинай знакомиться.",
+            (
+                "💗 Добро пожаловать "
+                "в OLIVKA MATCH!\n\n"
+                "Создай свою анкету."
+            ),
             reply_markup=create_menu(),
         )
+
+
+async def help_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    profile = await get_profile(
+        update.effective_user.id
+    )
+
+    await update.message.reply_text(
+        (
+            "💗 <b>OLIVKA MATCH</b>\n\n"
+
+            "🔥 <b>Смотреть анкеты</b> — "
+            "листать подходящих людей.\n\n"
+
+            "💌 <b>Кто меня лайкнул</b> — "
+            "посмотреть входящие симпатии.\n\n"
+
+            "💞 <b>Мои мэтчи</b> — "
+            "взаимные симпатии.\n\n"
+
+            "👤 <b>Моя анкета</b> — "
+            "посмотреть свою карточку.\n\n"
+
+            "✏️ <b>Редактировать</b> — "
+            "изменить данные, фото и видео.\n\n"
+
+            "При взаимном ❤️ "
+            "MATCH автоматически "
+            "приходит обоим."
+        ),
+        parse_mode="HTML",
+        reply_markup=(
+            main_menu()
+            if profile
+            else create_menu()
+        ),
+    )
 
 
 # ============================================================
@@ -1640,12 +2767,12 @@ async def create_name(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    name = (
+    value = (
         update.message.text
         .strip()
     )
 
-    if len(name) < 2:
+    if len(value) < 2:
 
         await update.message.reply_text(
             "Напиши имя чуть подробнее 🙂"
@@ -1654,8 +2781,8 @@ async def create_name(
         return CREATE_NAME
 
     context.user_data[
-        "new_name"
-    ] = name
+        "name"
+    ] = value
 
     await update.message.reply_text(
         "Сколько тебе лет?\n\n"
@@ -1670,41 +2797,32 @@ async def create_age(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    text = (
+    value = (
         update.message.text
         .strip()
     )
 
-    if not text.isdigit():
+    if not value.isdigit():
 
         await update.message.reply_text(
-            "Напиши возраст цифрами 🙂"
+            "Возраст напиши цифрами."
         )
 
         return CREATE_AGE
 
-    age = int(text)
+    age = int(value)
 
-    if age < 18:
-
-        await update.message.reply_text(
-            "OLIVKA MATCH "
-            "доступен только 18+ 🔞",
-            reply_markup=create_menu(),
-        )
-
-        return ConversationHandler.END
-
-    if age > 100:
+    if age < 18 or age > 100:
 
         await update.message.reply_text(
-            "Проверь возраст 🙂"
+            "Возраст должен быть "
+            "от 18 до 100."
         )
 
         return CREATE_AGE
 
     context.user_data[
-        "new_age"
+        "age"
     ] = age
 
     await update.message.reply_text(
@@ -1720,7 +2838,7 @@ async def create_city(
 ):
 
     context.user_data[
-        "new_city"
+        "city"
     ] = (
         update.message.text
         .strip()
@@ -1739,25 +2857,25 @@ async def create_gender(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    gender = (
+    value = (
         update.message.text
         .strip()
     )
 
-    if gender not in (
+    if value not in (
         "👩 Девушка",
         "👨 Мужчина",
     ):
 
         await update.message.reply_text(
-            "Выбери вариант кнопкой 👇"
+            "Выбери вариант кнопкой."
         )
 
         return CREATE_GENDER
 
     context.user_data[
-        "new_gender"
-    ] = gender
+        "gender"
+    ] = value
 
     await update.message.reply_text(
         "Кого хочешь найти? 💘",
@@ -1772,30 +2890,29 @@ async def create_looking(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    looking = (
+    value = (
         update.message.text
         .strip()
     )
 
-    if looking not in (
+    if value not in (
         "👩 Девушку",
         "👨 Мужчину",
         "💞 Неважно",
     ):
 
         await update.message.reply_text(
-            "Выбери вариант кнопкой 👇"
+            "Выбери вариант кнопкой."
         )
 
         return CREATE_LOOKING
 
     context.user_data[
-        "new_looking"
-    ] = looking
+        "looking_for"
+    ] = value
 
     await update.message.reply_text(
-        "Расскажи немного "
-        "о себе ✨",
+        "Расскажи немного о себе ✨",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -1807,30 +2924,26 @@ async def create_about(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    about = (
+    value = (
         update.message.text
         .strip()
     )
 
-    if len(about) > 500:
+    if len(value) > 500:
 
         await update.message.reply_text(
-            "Описание должно быть "
-            "до 500 символов."
+            "Максимум 500 символов."
         )
 
         return CREATE_ABOUT
 
     context.user_data[
-        "new_about"
-    ] = about
+        "about"
+    ] = value
 
     await update.message.reply_text(
         "Теперь отправь "
-        "главное фото 📸\n\n"
-        "После создания анкеты "
-        "можно добавить ещё "
-        "фото и видео."
+        "главное фото 📸"
     )
 
     return CREATE_PHOTO
@@ -1844,42 +2957,60 @@ async def create_first_photo(
     if not update.message.photo:
 
         await update.message.reply_text(
-            "Нужно отправить "
-            "именно фотографию 📸"
+            "Отправь именно "
+            "фотографию 📸"
         )
 
         return CREATE_PHOTO
 
     user = update.effective_user
 
-    photo_id = (
+    file_id = (
         update.message
         .photo[-1]
         .file_id
     )
 
     profile = {
-        "user_id": user.id,
-        "username": user.username,
-        "name": context.user_data[
-            "new_name"
-        ],
-        "age": context.user_data[
-            "new_age"
-        ],
-        "city": context.user_data[
-            "new_city"
-        ],
-        "gender": context.user_data[
-            "new_gender"
-        ],
-        "looking_for": context.user_data[
-            "new_looking"
-        ],
-        "about": context.user_data[
-            "new_about"
-        ],
-        "photo": photo_id,
+
+        "user_id":
+            user.id,
+
+        "username":
+            user.username,
+
+        "name":
+            context.user_data[
+                "name"
+            ],
+
+        "age":
+            context.user_data[
+                "age"
+            ],
+
+        "city":
+            context.user_data[
+                "city"
+            ],
+
+        "gender":
+            context.user_data[
+                "gender"
+            ],
+
+        "looking_for":
+            context.user_data[
+                "looking_for"
+            ],
+
+        "about":
+            context.user_data[
+                "about"
+            ],
+
+        "photo":
+            file_id,
     }
 
     try:
@@ -1890,21 +3021,22 @@ async def create_first_photo(
 
         await replace_with_first_photo(
             user.id,
-            photo_id,
+            file_id,
         )
 
     except Exception as error:
 
         logger.exception(
-            "Create profile error: %s",
+            "Profile save error: %s",
             error,
         )
 
         await update.message.reply_text(
-            "Не удалось сохранить "
-            "анкету 😔\n"
-            "Попробуй отправить фото "
-            "ещё раз."
+            (
+                "Не удалось сохранить "
+                "анкету 😔\n"
+                "Попробуй фото ещё раз."
+            )
         )
 
         return CREATE_PHOTO
@@ -1912,10 +3044,11 @@ async def create_first_photo(
     context.user_data.clear()
 
     await update.message.reply_text(
-        "✅ Анкета сохранена!\n\n"
-        "Теперь OLIVKA MATCH "
-        "сам будет присылать "
-        "подходящие новые анкеты 🔥",
+        (
+            "✅ Анкета готова!\n\n"
+            "Меню теперь всегда "
+            "находится внизу 👇"
+        ),
         reply_markup=main_menu(),
     )
 
@@ -1923,22 +3056,18 @@ async def create_first_photo(
         user.id
     )
 
-    await send_profile_album(
+    await send_profile_display(
         context.bot,
         user.id,
         saved,
     )
 
-    # Новому пользователю отправляем
-    # существующие подходящие анкеты.
     await send_initial_profiles(
         context.bot,
         user.id,
     )
 
-    # А существующим подходящим людям
-    # отправляем нового пользователя.
-    await notify_users_about_new_profile(
+    await notify_about_new_profile(
         context.bot,
         user.id,
     )
@@ -1966,17 +3095,21 @@ async def my_profile(
     if not profile:
 
         await update.message.reply_text(
-            "У тебя пока нет "
-            "анкеты 💗",
+            "У тебя пока нет анкеты.",
             reply_markup=create_menu(),
         )
 
         return
 
-    await send_profile_album(
+    await send_profile_display(
         context.bot,
         user_id,
         profile,
+    )
+
+    await update.message.reply_text(
+        "💗 Главное меню",
+        reply_markup=main_menu(),
     )
 
 
@@ -2000,8 +3133,7 @@ async def browse_profiles(
     if not profile:
 
         await update.message.reply_text(
-            "Сначала создай "
-            "свою анкету 💘",
+            "Сначала создай анкету.",
             reply_markup=create_menu(),
         )
 
@@ -2014,10 +3146,12 @@ async def browse_profiles(
     if not candidate:
 
         await update.message.reply_text(
-            "Пока подходящих "
-            "новых анкет нет 😌\n\n"
-            "Новые анкеты будут "
-            "приходить автоматически.",
+            (
+                "Пока новых подходящих "
+                "анкет нет 😌\n\n"
+                "Новые анкеты будут "
+                "приходить автоматически."
+            ),
             reply_markup=main_menu(),
         )
 
@@ -2036,6 +3170,146 @@ async def browse_profiles(
 
 
 # ============================================================
+# WHO LIKED ME
+# ============================================================
+
+async def who_liked_me(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user_id = (
+        update.effective_user.id
+    )
+
+    profile = await get_profile(
+        user_id
+    )
+
+    if not profile:
+
+        await update.message.reply_text(
+            "Сначала создай анкету 💗",
+            reply_markup=create_menu(),
+        )
+
+        return
+
+    people = await get_people_who_liked_me(
+        user_id
+    )
+
+    if not people:
+
+        await update.message.reply_text(
+            (
+                "💌 Пока нет новых "
+                "входящих лайков.\n\n"
+                "Когда кто-то поставит "
+                "тебе ❤️, он появится здесь."
+            ),
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    await update.message.reply_text(
+        (
+            "💌 Тебя лайкнули: "
+            f"{len(people)}"
+        )
+    )
+
+    for liked_profile in people[:10]:
+
+        await send_profile_for_choice(
+            context.bot,
+            user_id,
+            liked_profile,
+            header=(
+                "❤️ Ты понравилась "
+                "этому человеку"
+            ),
+        )
+
+
+# ============================================================
+# MY MATCHES
+# ============================================================
+
+async def my_matches(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    user_id = (
+        update.effective_user.id
+    )
+
+    profile = await get_profile(
+        user_id
+    )
+
+    if not profile:
+
+        await update.message.reply_text(
+            "Сначала создай анкету 💗",
+            reply_markup=create_menu(),
+        )
+
+        return
+
+    matches = await get_my_matches(
+        user_id
+    )
+
+    if not matches:
+
+        await update.message.reply_text(
+            (
+                "💞 Пока мэтчей нет.\n\n"
+                "Как только лайк станет "
+                "взаимным, бот сразу "
+                "уведомит вас обоих."
+            ),
+            reply_markup=main_menu(),
+        )
+
+        return
+
+    await update.message.reply_text(
+        (
+            "💞 Твои мэтчи: "
+            f"{len(matches)}"
+        )
+    )
+
+    for match_profile in matches:
+
+        await send_profile_display(
+            context.bot,
+            user_id,
+            match_profile,
+        )
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "💞 Вы понравились "
+                "друг другу"
+            ),
+            reply_markup=contact_keyboard(
+                match_profile
+            ),
+        )
+
+    await update.message.reply_text(
+        "💗 Главное меню",
+        reply_markup=main_menu(),
+    )
+
+
+# ============================================================
 # LIKE / SKIP
 # ============================================================
 
@@ -2050,7 +3324,7 @@ async def profile_action(
 
     try:
 
-        action, target_text = (
+        action, target = (
             query.data.split(
                 ":",
                 1,
@@ -2058,17 +3332,17 @@ async def profile_action(
         )
 
         target_id = int(
-            target_text
+            target
         )
 
     except Exception:
 
         return
 
-    user_id = query.from_user.id
+    user_id = (
+        query.from_user.id
+    )
 
-    # Убираем старые кнопки,
-    # чтобы случайно не нажать дважды.
     try:
 
         await query.edit_message_reply_markup(
@@ -2076,6 +3350,7 @@ async def profile_action(
         )
 
     except Exception:
+
         pass
 
     if action == "skip":
@@ -2086,7 +3361,8 @@ async def profile_action(
         )
 
         await query.message.reply_text(
-            "👎 Пропущено"
+            "👎 Пропущено",
+            reply_markup=main_menu(),
         )
 
     elif action == "like":
@@ -2096,18 +3372,15 @@ async def profile_action(
             target_id,
         )
 
-        # Надёжная проверка двух лайков.
-        new_match = (
+        matched = (
             await create_match_if_mutual(
                 user_id,
                 target_id,
             )
         )
 
-        if new_match:
+        if matched:
 
-            # MATCH автоматически
-            # отправляется обоим.
             await send_match_notifications(
                 context.bot,
                 user_id,
@@ -2117,11 +3390,13 @@ async def profile_action(
         else:
 
             await query.message.reply_text(
-                "❤️ Лайк отправлен!"
+                "❤️ Лайк отправлен!",
+                reply_markup=main_menu(),
             )
 
-    # После действия сразу пытаемся
-    # показать следующую анкету.
+    # После выбора сразу предлагаем
+    # следующую подходящую анкету.
+
     candidate = await get_next_profile(
         user_id
     )
@@ -2142,15 +3417,17 @@ async def profile_action(
     else:
 
         await query.message.reply_text(
-            "На данный момент "
-            "подходящие анкеты закончились 😊\n\n"
-            "Я пришлю новые автоматически.",
+            (
+                "Пока это всё 😊\n"
+                "Новые анкеты будут "
+                "приходить автоматически."
+            ),
             reply_markup=main_menu(),
         )
 
 
 # ============================================================
-# EDIT PROFILE
+# EDIT
 # ============================================================
 
 async def open_edit_menu(
@@ -2165,8 +3442,7 @@ async def open_edit_menu(
     if not profile:
 
         await update.message.reply_text(
-            "Сначала создай "
-            "анкету 💘",
+            "Сначала создай анкету.",
             reply_markup=create_menu(),
         )
 
@@ -2211,10 +3487,11 @@ async def edit_callback(
         )
 
         await query.message.reply_text(
-            "📸 Фото и видео\n\n"
-            f"Сейчас: "
-            f"{len(media)}/"
-            f"{MAX_MEDIA}",
+            (
+                "📸 Фото и видео\n\n"
+                f"Сейчас: "
+                f"{len(media)}/{MAX_MEDIA}"
+            ),
             reply_markup=media_menu(),
         )
 
@@ -2224,44 +3501,39 @@ async def edit_callback(
         "edit_field"
     ] = action
 
-    prompts = {
-        "name":
-            "Напиши новое имя:",
-
-        "age":
-            "Напиши новый возраст:",
-
-        "city":
-            "Напиши новый город:",
-
-        "gender":
-            "Выбери пол:",
-
-        "looking_for":
-            "Кого хочешь найти?",
-
-        "about":
-            "Напиши новое описание:",
-    }
-
     if action == "gender":
 
         await query.message.reply_text(
-            prompts[action],
+            "Выбери пол:",
             reply_markup=gender_keyboard(),
         )
 
     elif action == "looking_for":
 
         await query.message.reply_text(
-            prompts[action],
+            "Кого ищешь?",
             reply_markup=looking_keyboard(),
         )
 
     else:
 
+        names = {
+
+            "name":
+                "Новое имя:",
+
+            "age":
+                "Новый возраст:",
+
+            "city":
+                "Новый город:",
+
+            "about":
+                "Новое описание:",
+        }
+
         await query.message.reply_text(
-            prompts[action],
+            names[action],
             reply_markup=ReplyKeyboardRemove(),
         )
 
@@ -2273,10 +3545,6 @@ async def save_edit_value(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
-    user_id = (
-        update.effective_user.id
-    )
-
     field = (
         context.user_data
         .get("edit_field")
@@ -2286,88 +3554,70 @@ async def save_edit_value(
 
         return ConversationHandler.END
 
-    text = (
+    value = (
         update.message.text
         .strip()
     )
 
     if field == "age":
 
-        if not text.isdigit():
+        if not value.isdigit():
 
             await update.message.reply_text(
-                "Возраст напиши "
-                "цифрами."
+                "Возраст напиши цифрами."
             )
 
             return EDIT_VALUE
 
-        value = int(text)
+        value = int(value)
 
-        if (
-            value < 18
-            or value > 100
-        ):
+        if value < 18 or value > 100:
 
             await update.message.reply_text(
-                "Возраст должен быть "
-                "от 18 до 100."
+                "Возраст от 18 до 100."
             )
 
             return EDIT_VALUE
 
     elif field == "gender":
 
-        if text not in (
+        if value not in (
             "👩 Девушка",
             "👨 Мужчина",
         ):
 
             await update.message.reply_text(
-                "Выбери вариант "
-                "кнопкой."
+                "Выбери вариант кнопкой."
             )
 
             return EDIT_VALUE
 
-        value = text
-
     elif field == "looking_for":
 
-        if text not in (
+        if value not in (
             "👩 Девушку",
             "👨 Мужчину",
             "💞 Неважно",
         ):
 
             await update.message.reply_text(
-                "Выбери вариант "
-                "кнопкой."
+                "Выбери вариант кнопкой."
             )
 
             return EDIT_VALUE
-
-        value = text
 
     elif field == "about":
 
-        if len(text) > 500:
+        if len(value) > 500:
 
             await update.message.reply_text(
-                "Описание должно быть "
-                "до 500 символов."
+                "Максимум 500 символов."
             )
 
             return EDIT_VALUE
 
-        value = text
-
-    else:
-
-        value = text
-
     await update_profile_field(
-        user_id,
+        update.effective_user.id,
         field,
         value,
     )
@@ -2380,11 +3630,6 @@ async def save_edit_value(
     await update.message.reply_text(
         "✅ Сохранено.",
         reply_markup=main_menu(),
-    )
-
-    await update.message.reply_text(
-        "Изменить что-нибудь ещё?",
-        reply_markup=edit_menu(),
     )
 
     return ConversationHandler.END
@@ -2421,65 +3666,63 @@ async def media_callback(
             user_id
         )
 
-        if (
-            len(media)
-            >= MAX_MEDIA
-        ):
+        if len(media) >= MAX_MEDIA:
 
             await query.message.reply_text(
-                f"Уже добавлено максимум "
-                f"{MAX_MEDIA} фото/видео."
+                (
+                    f"Уже добавлен максимум "
+                    f"{MAX_MEDIA} файлов."
+                ),
+                reply_markup=main_menu(),
             )
 
             return ConversationHandler.END
 
         await query.message.reply_text(
-            "Отправь новое "
-            "фото или видео 📸🎬\n\n"
-            f"Сейчас: "
-            f"{len(media)}/{MAX_MEDIA}"
+            "Отправь фото или видео 📸🎬",
+            reply_markup=ReplyKeyboardRemove(),
         )
 
         return ADD_MEDIA
 
     if action == "delete_last":
 
-        success = (
-            await delete_last_media(
-                user_id
-            )
-        )
-
-        if not success:
-
-            await query.message.reply_text(
-                "Главное фото удалить "
-                "нельзя.\n\n"
-                "В анкете должно "
-                "остаться хотя бы "
-                "одно фото."
-            )
-
-            return ConversationHandler.END
-
-        media = await get_media(
+        removed = await delete_last_media(
             user_id
         )
 
-        await query.message.reply_text(
-            "🗑 Последнее фото/видео "
-            "удалено.\n\n"
-            f"Осталось: "
-            f"{len(media)}/{MAX_MEDIA}",
-            reply_markup=media_menu(),
-        )
+        if not removed:
+
+            await query.message.reply_text(
+                (
+                    "Главное фото удалить нельзя.\n\n"
+                    "В анкете должно остаться "
+                    "хотя бы одно фото."
+                ),
+                reply_markup=main_menu(),
+            )
+
+        else:
+
+            media = await get_media(
+                user_id
+            )
+
+            await query.message.reply_text(
+                (
+                    "🗑 Последний файл удалён.\n\n"
+                    f"Осталось: "
+                    f"{len(media)}/{MAX_MEDIA}"
+                ),
+                reply_markup=media_menu(),
+            )
 
         return ConversationHandler.END
 
     if action == "back":
 
         await query.message.reply_text(
-            "✏️ Редактирование анкеты",
+            "✏️ Редактирование",
             reply_markup=edit_menu(),
         )
 
@@ -2495,15 +3738,17 @@ async def receive_extra_media(
         update.effective_user.id
     )
 
-    media = await get_media(
+    current = await get_media(
         user_id
     )
 
-    if len(media) >= MAX_MEDIA:
+    if len(current) >= MAX_MEDIA:
 
         await update.message.reply_text(
-            f"Максимум "
-            f"{MAX_MEDIA} фото/видео.",
+            (
+                f"Максимум "
+                f"{MAX_MEDIA} файлов."
+            ),
             reply_markup=main_menu(),
         )
 
@@ -2532,8 +3777,7 @@ async def receive_extra_media(
     else:
 
         await update.message.reply_text(
-            "Нужно отправить "
-            "фото или видео."
+            "Нужно отправить фото или видео."
         )
 
         return ADD_MEDIA
@@ -2554,9 +3798,7 @@ async def receive_extra_media(
         )
 
         await update.message.reply_text(
-            "Не удалось сохранить "
-            "файл 😔\n"
-            "Попробуй ещё раз."
+            "Не удалось сохранить файл 😔"
         )
 
         return ADD_MEDIA
@@ -2564,27 +3806,26 @@ async def receive_extra_media(
     if not success:
 
         await update.message.reply_text(
-            f"Максимум "
-            f"{MAX_MEDIA} фото/видео."
+            (
+                f"Максимум "
+                f"{MAX_MEDIA} файлов."
+            ),
+            reply_markup=main_menu(),
         )
 
         return ConversationHandler.END
 
-    media = await get_media(
+    current = await get_media(
         user_id
     )
 
     await update.message.reply_text(
-        "✅ Добавлено!\n\n"
-        f"Сейчас в анкете: "
-        f"{len(media)}/{MAX_MEDIA}",
+        (
+            "✅ Добавлено!\n\n"
+            f"Сейчас: "
+            f"{len(current)}/{MAX_MEDIA}"
+        ),
         reply_markup=main_menu(),
-    )
-
-    await update.message.reply_text(
-        "Можно добавить ещё "
-        "или вернуться назад.",
-        reply_markup=media_menu(),
     )
 
     return ConversationHandler.END
@@ -2626,9 +3867,11 @@ async def delete_profile_callback(
     )
 
     await query.message.reply_text(
-        "Точно удалить анкету?\n\n"
-        "Фото, видео, лайки "
-        "и мэтчи будут удалены.",
+        (
+            "Точно удалить анкету?\n\n"
+            "Фото, видео, лайки "
+            "и мэтчи будут удалены."
+        ),
         reply_markup=keyboard,
     )
 
@@ -2678,11 +3921,11 @@ async def cancel(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    context.user_data.clear()
+
     profile = await get_profile(
         update.effective_user.id
     )
-
-    context.user_data.clear()
 
     await update.message.reply_text(
         "Действие отменено.",
@@ -2697,7 +3940,30 @@ async def cancel(
 
 
 # ============================================================
-# ERROR HANDLER
+# UNKNOWN TEXT
+# ============================================================
+
+async def unknown_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    profile = await get_profile(
+        update.effective_user.id
+    )
+
+    await update.message.reply_text(
+        "Выбери действие из меню 👇",
+        reply_markup=(
+            main_menu()
+            if profile
+            else create_menu()
+        ),
+    )
+
+
+# ============================================================
+# ERROR
 # ============================================================
 
 async def error_handler(
@@ -2712,13 +3978,13 @@ async def error_handler(
 
 
 # ============================================================
-# TELEGRAM APPLICATION
+# APPLICATION
 # ============================================================
 
 if not TOKEN:
 
     raise RuntimeError(
-        "BOT_TOKEN is missing"
+        "BOT_TOKEN missing"
     )
 
 
@@ -2893,7 +4159,7 @@ media_conversation = ConversationHandler(
 
 
 # ============================================================
-# HANDLERS
+# COMMANDS
 # ============================================================
 
 application.add_handler(
@@ -2902,6 +4168,46 @@ application.add_handler(
         start,
     )
 )
+
+application.add_handler(
+    CommandHandler(
+        "profile",
+        my_profile,
+    )
+)
+
+application.add_handler(
+    CommandHandler(
+        "browse",
+        browse_profiles,
+    )
+)
+
+application.add_handler(
+    CommandHandler(
+        "likes",
+        who_liked_me,
+    )
+)
+
+application.add_handler(
+    CommandHandler(
+        "matches",
+        my_matches,
+    )
+)
+
+application.add_handler(
+    CommandHandler(
+        "help",
+        help_handler,
+    )
+)
+
+
+# ============================================================
+# CONVERSATIONS
+# ============================================================
 
 application.add_handler(
     create_conversation
@@ -2916,15 +4222,9 @@ application.add_handler(
 )
 
 
-application.add_handler(
-    MessageHandler(
-        filters.Regex(
-            r"^👤 Моя анкета$"
-        ),
-        my_profile,
-    )
-)
-
+# ============================================================
+# MAIN MENU BUTTONS
+# ============================================================
 
 application.add_handler(
     MessageHandler(
@@ -2935,16 +4235,55 @@ application.add_handler(
     )
 )
 
+application.add_handler(
+    MessageHandler(
+        filters.Regex(
+            r"^💌 Кто меня лайкнул$"
+        ),
+        who_liked_me,
+    )
+)
 
 application.add_handler(
     MessageHandler(
         filters.Regex(
-            r"^✏️ Редактировать анкету$"
+            r"^💞 Мои мэтчи$"
+        ),
+        my_matches,
+    )
+)
+
+application.add_handler(
+    MessageHandler(
+        filters.Regex(
+            r"^👤 Моя анкета$"
+        ),
+        my_profile,
+    )
+)
+
+application.add_handler(
+    MessageHandler(
+        filters.Regex(
+            r"^✏️ Редактировать$"
         ),
         open_edit_menu,
     )
 )
 
+application.add_handler(
+    MessageHandler(
+        filters.Regex(
+            r"^ℹ️ Помощь$"
+        ),
+        help_handler,
+    )
+)
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
 
 application.add_handler(
     CallbackQueryHandler(
@@ -2952,7 +4291,6 @@ application.add_handler(
         pattern=r"^edit:(media|done)$",
     )
 )
-
 
 application.add_handler(
     CallbackQueryHandler(
@@ -2964,14 +4302,12 @@ application.add_handler(
     )
 )
 
-
 application.add_handler(
     CallbackQueryHandler(
         delete_profile_callback,
         pattern=r"^profile_delete$",
     )
 )
-
 
 application.add_handler(
     CallbackQueryHandler(
@@ -2980,7 +4316,6 @@ application.add_handler(
     )
 )
 
-
 application.add_handler(
     CallbackQueryHandler(
         delete_cancel_callback,
@@ -2988,11 +4323,23 @@ application.add_handler(
     )
 )
 
-
 application.add_handler(
     CallbackQueryHandler(
         profile_action,
         pattern=r"^(like|skip):",
+    )
+)
+
+
+# ============================================================
+# FALLBACK
+# ============================================================
+
+application.add_handler(
+    MessageHandler(
+        filters.TEXT
+        & ~filters.COMMAND,
+        unknown_text,
     )
 )
 
@@ -3003,11 +4350,11 @@ application.add_error_handler(
 
 
 # ============================================================
-# RENDER / WEBHOOK
+# WEBHOOK
 # ============================================================
 
 async def health(
-    request
+    request,
 ):
 
     return web.Response(
@@ -3019,7 +4366,7 @@ async def health(
 
 
 async def telegram_webhook(
-    request
+    request,
 ):
 
     data = await request.json()
@@ -3038,8 +4385,12 @@ async def telegram_webhook(
     )
 
 
+# ============================================================
+# STARTUP
+# ============================================================
+
 async def on_startup(
-    web_app
+    web_app,
 ):
 
     await init_database()
@@ -3055,18 +4406,68 @@ async def on_startup(
     if not render_url:
 
         raise RuntimeError(
-            "RENDER_EXTERNAL_URL "
-            "is missing"
+            "RENDER_EXTERNAL_URL missing"
         )
 
     webhook_url = (
-        f"{render_url.rstrip('/')}"
-        f"/telegram"
+        render_url.rstrip("/")
+        + "/telegram"
     )
 
     await application.bot.set_webhook(
         webhook_url
     )
+
+    # ========================================================
+    # SYSTEM TELEGRAM MENU
+    # ========================================================
+
+    await application.bot.set_my_commands(
+        [
+            BotCommand(
+                "start",
+                "Главное меню",
+            ),
+
+            BotCommand(
+                "browse",
+                "Смотреть анкеты",
+            ),
+
+            BotCommand(
+                "likes",
+                "Кто меня лайкнул",
+            ),
+
+            BotCommand(
+                "matches",
+                "Мои мэтчи",
+            ),
+
+            BotCommand(
+                "profile",
+                "Моя анкета",
+            ),
+
+            BotCommand(
+                "help",
+                "Помощь",
+            ),
+        ]
+    )
+
+    try:
+
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonCommands()
+        )
+
+    except Exception as error:
+
+        logger.warning(
+            "Telegram menu warning: %s",
+            error,
+        )
 
     logger.info(
         "Webhook: %s",
@@ -3074,12 +4475,16 @@ async def on_startup(
     )
 
     logger.info(
-        "OLIVKA MATCH started"
+        "OLIVKA MATCH STARTED"
     )
 
 
+# ============================================================
+# CLEANUP
+# ============================================================
+
 async def on_cleanup(
-    web_app
+    web_app,
 ):
 
     global db_pool
@@ -3089,6 +4494,7 @@ async def on_cleanup(
         await application.stop()
 
     except Exception:
+
         pass
 
     try:
@@ -3096,6 +4502,7 @@ async def on_cleanup(
         await application.shutdown()
 
     except Exception:
+
         pass
 
     if db_pool:
